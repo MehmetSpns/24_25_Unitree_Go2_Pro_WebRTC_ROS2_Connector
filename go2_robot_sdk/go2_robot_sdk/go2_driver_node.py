@@ -27,6 +27,8 @@ import logging
 import os
 import threading
 import asyncio
+import math
+
 
 from aiortc import MediaStreamTrack
 from cv_bridge import CvBridge
@@ -103,6 +105,8 @@ class RobotBaseNode(Node):
         self.imu_pub = []
         self.img_pub = []
         self.camera_info_pub = []
+        self.processed_lidar = {}  # NEW: holds valid PointCloud2 for obstacle detection
+
 
         if self.conn_mode == 'single':
             self.joint_pub.append(self.create_publisher(
@@ -155,14 +159,15 @@ class RobotBaseNode(Node):
             self.create_subscription(
                 Twist,
                 'cmd_vel_out',
-                lambda msg: self.cmd_vel_cb(msg, "0"),
+                self.cmd_vel_cb_wrapped("0"),
                 qos_profile)
+
         else:
             for i in range(len(self.robot_ip_lst)):
                 self.create_subscription(
                     Twist,
                     f'robot{str(i)}/cmd_vel_out',
-                    lambda msg: self.cmd_vel_cb(msg, str(i)),
+                    self.cmd_vel_cb_wrapped(str(i)),
                     qos_profile)
 
         self.create_subscription(
@@ -195,6 +200,18 @@ class RobotBaseNode(Node):
         if not self.camera_only:
             self.timer_lidar = self.create_timer(0.5, self.timer_callback_lidar)
 
+                # Add these parameters for obstacle avoidance
+        self.declare_parameter('safety_distance', 0.3)  # meters
+        self.declare_parameter('max_avoidance_angle', 0.3)  # radians
+        self.safety_distance = self.get_parameter('safety_distance').value
+        self.max_avoidance_angle = self.get_parameter('max_avoidance_angle').value
+        
+        # For storing obstacle information
+        self.obstacle_detected = False
+        self.obstacle_direction = 0.0  # radians (0=front, positive=right)
+        self.raw_lidar_data = {}  # For storing raw WebRTC lidar data
+        self.robot_lidar = {} 
+
     def timer_callback(self):
         if self.conn_type == 'webrtc':
             if not self.camera_only:
@@ -204,22 +221,36 @@ class RobotBaseNode(Node):
             self.publish_joint_state_webrtc()
 
     def timer_callback_lidar(self):
-        if self.conn_type == 'webrtc':
-            self.publish_lidar_webrtc()
+        if self.conn_type != 'webrtc':
+            return
+        
+        for robot_num in self.raw_lidar_data:
+            # Process the lidar data
+            cloud = self.process_lidar_data(robot_num)
+            if cloud is None:
+                continue
+                
+            # Store for obstacle detection
+            self.processed_lidar[robot_num] = cloud
+            
+            # Publish
+            idx = int(robot_num)
+            if idx < len(self.go2_lidar_pub):
+                self.go2_lidar_pub[idx].publish(cloud)
+                
+            # Perform obstacle detection
+            self.obstacle_detected, self.obstacle_direction = self.detect_obstacles(cloud)
 
-    def cmd_vel_cb(self, msg, robot_num):
-        x = msg.linear.x
-        y = msg.linear.y
-        z = msg.angular.z
+  
 
-        # Allow omni-directional movement
-        if x != 0.0 or y != 0.0 or z != 0.0:
-            self.robot_cmd_vel[robot_num] = gen_mov_command(
-                round(x, 2), round(y, 2), round(z, 2))
 
 
     def joy_cb(self, msg):
         self.joy_state = msg
+
+    def cmd_vel_cb_wrapped(self, robot_num):
+        return lambda msg: self.cmd_vel_cb(msg, robot_num)
+
 
     def publish_body_poss_cyclonedds(self, msg):
         odom_trans = TransformStamped()
@@ -315,18 +346,80 @@ class RobotBaseNode(Node):
             asyncio.sleep(0)
 
     def on_data_channel_message(self, _, msg, robot_num):
-
         if msg.get('topic') == RTC_TOPIC["ULIDAR_ARRAY"]:
-            self.robot_lidar[robot_num] = msg
+            # Store the raw message
+            self.raw_lidar_data[robot_num] = msg
+            # Process the point cloud (we'll do this in the timer callback)
 
-        if msg.get('topic') == RTC_TOPIC['ROBOTODOM']:
-            self.robot_odom[robot_num] = msg
+    def process_lidar_data(self, robot_num):
+        """Convert and process lidar data for a specific robot"""
+        if robot_num not in self.raw_lidar_data:
+            return None
+        
+        raw_data = self.raw_lidar_data[robot_num]
+        
+        try:
+            # Create header
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg()
+            header.frame_id = f"robot{robot_num}/radar" if self.conn_mode != 'single' else "radar"
+            
+            # Extract points
+            points = []
+            positions = raw_data["decoded_data"]["positions"]
+            
+            for i in range(0, len(positions), 3):
+                x = positions[i]
+                y = positions[i+1]
+                z = positions[i+2]
+                points.append([x, y, z, 1.0])  # x,y,z,intensity
+                
+            # Create PointCloud2 fields
+            fields = [
+                PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            ]
+            
+            # Create the PointCloud2 message
+            cloud = point_cloud2.create_cloud(header, fields, points)
+            return cloud
+            
+        except Exception as e:
+            self.get_logger().error(f"Error processing lidar data: {str(e)}")
+            return None
 
-        if msg.get('topic') == RTC_TOPIC['LF_SPORT_MOD_STATE']:
-            self.robot_sport_state[robot_num] = msg
-
-        if msg.get('topic') == RTC_TOPIC['LOW_STATE']:
-            self.robot_low_cmd[robot_num] = msg
+    def convert_to_pointcloud2(self, lidar_msg):
+        """Convert WebRTC lidar data to PointCloud2 format"""
+        if not lidar_msg or 'decoded_data' not in lidar_msg:
+            return None
+        
+        # Create header
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = "odom"
+        
+        # Extract points
+        points = []
+        positions = lidar_msg["decoded_data"]["positions"]
+        
+        for i in range(0, len(positions), 3):
+            x = positions[i]
+            y = positions[i+1]
+            z = positions[i+2]
+            intensity = 1.0  # Default intensity
+            points.append([x, y, z, intensity])
+        
+        # Create PointCloud2 message
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        
+        return point_cloud2.create_cloud(header, fields, points)
 
     def publish_odom_webrtc(self):
         for i in range(len(self.robot_odom)):
@@ -395,21 +488,22 @@ class RobotBaseNode(Node):
                     self.robot_lidar[str(i)]['data']['origin'],
                     0
                 )
+
                 point_cloud = PointCloud2()
                 point_cloud.header = Header(frame_id="odom")
                 point_cloud.header.stamp = self.get_clock().now().to_msg()
                 fields = [
-                    PointField(name='x', offset=0,
-                               datatype=PointField.FLOAT32, count=1),
-                    PointField(name='y', offset=4,
-                               datatype=PointField.FLOAT32, count=1),
-                    PointField(name='z', offset=8,
-                               datatype=PointField.FLOAT32, count=1),
-                    PointField(name='intensity', offset=12,
-                               datatype=PointField.FLOAT32, count=1),
+                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
                 ]
-                point_cloud = point_cloud2.create_cloud(
-                    point_cloud.header, fields, points)
+                point_cloud = point_cloud2.create_cloud(point_cloud.header, fields, points)
+
+                # ✅ Store valid PointCloud2 for obstacle detection
+                self.processed_lidar[str(i)] = point_cloud
+
+                # Publish
                 self.go2_lidar_pub[i].publish(point_cloud)
 
     def publish_joint_state_webrtc(self):
@@ -534,7 +628,107 @@ class RobotBaseNode(Node):
                     map(float, self.robot_sport_state[str(i)]["data"]["imu_state"]["rpy"]))
                 imu.temperature = self.robot_sport_state[str(
                     i)]["data"]["imu_state"]["temperature"]
-                self.imu_pub[i].publish(imu)
+                self.imu_pub[i].publish(imu)    
+
+    def detect_obstacles(self, point_cloud):
+        """Analyze point cloud for obstacles in front of the robot"""
+        if point_cloud is None:
+            return False, 0.0
+        
+        try:
+            # Read points from the cloud
+            points = point_cloud2.read_points(point_cloud, 
+                                            field_names=("x", "y", "z"), 
+                                            skip_nans=True)
+            
+            front_points = []
+            for point in points:
+                x, y, z = point
+                # Only consider points in front of the robot and within safety distance
+                if x > 0 and abs(y) < 1.0 and x < self.safety_distance and abs(z) < 0.3:
+                    front_points.append((x, y))
+            
+            if not front_points:
+                return False, 0.0
+            
+            # Calculate average obstacle position
+            avg_x = sum(p[0] for p in front_points) / len(front_points)
+            avg_y = sum(p[1] for p in front_points) / len(front_points)
+            
+            # Calculate direction (0=straight ahead, positive=to the right)
+            obstacle_direction = math.atan2(avg_y, avg_x)
+            
+            return True, obstacle_direction, avg_x
+        
+        except Exception as e:
+            self.get_logger().error(f"Error processing point cloud: {str(e)}")
+            return False, 0.0, float('inf')
+    
+    def cmd_vel_cb(self, msg, robot_num):
+        original_x = msg.linear.x
+        original_y = msg.linear.y
+        original_z = msg.angular.z
+
+        # Get current obstacle info from processed lidar
+        if str(robot_num) in self.processed_lidar:
+            point_cloud = self.processed_lidar[str(robot_num)]
+            self.get_logger().info(f"Type of point_cloud: {type(point_cloud)}")
+        self.obstacle_detected, self.obstacle_direction, avg_x = self.detect_obstacles(point_cloud)
+        else:
+            avg_x = float('inf')
+
+        if self.obstacle_detected and original_x > 0:
+            proximity_factor = max(0.0, min(1.0, (self.safety_distance - avg_x) / self.safety_distance))
+            adjusted_x = max(0.05, original_x * (1.0 - proximity_factor * 0.5))
+            avoidance_angle = self.max_avoidance_angle * proximity_factor
+
+            if self.obstacle_direction > 0:
+                adjusted_z = original_z - avoidance_angle
+            else:
+                adjusted_z = original_z + avoidance_angle
+
+            self.robot_cmd_vel[robot_num] = gen_mov_command(
+                round(adjusted_x, 2),
+                round(original_y, 2),
+                round(adjusted_z, 2))
+
+            self.get_logger().info(f"Obstacle detected! Adjusted command: x={adjusted_x:.2f}, z={adjusted_z:.2f}")
+        else:
+            self.robot_cmd_vel[robot_num] = gen_mov_command(
+                round(original_x, 2),
+                round(original_y, 2),
+                round(original_z, 2))
+
+
+    def publish_lidar_webrtc(self):
+        for i in range(len(self.robot_lidar)):
+            if self.robot_lidar[str(i)]:
+                # Existing point cloud processing
+                points = update_meshes_for_cloud2(
+                    self.robot_lidar[str(i)]["decoded_data"]["positions"],
+                    self.robot_lidar[str(i)]["decoded_data"]["uvs"],
+                    self.robot_lidar[str(i)]['data']['resolution'],
+                    self.robot_lidar[str(i)]['data']['origin'],
+                    0
+                )
+                
+                # Create PointCloud2 message
+                point_cloud = PointCloud2()
+                point_cloud.header = Header(frame_id="odom")
+                point_cloud.header.stamp = self.get_clock().now().to_msg()
+                fields = [
+                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+                ]
+                point_cloud = point_cloud2.create_cloud(point_cloud.header, fields, points)
+                
+                # Store the processed point cloud for obstacle detection
+                self.processed_lidar[str(i)] = point_cloud
+                
+                # Publish
+                self.go2_lidar_pub[i].publish(point_cloud)
 
     async def run(self, conn, robot_num):
         self.conn[robot_num] = conn
