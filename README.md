@@ -294,6 +294,57 @@ If you are running ROS2 under WSL2 - you may need to configure Joystick\Gamepad 
     -------------------------------------------------------------------------------
     0 : 030000005e040000120b000007050000 :    true :  false : Xbox Series X Controller
     ```
+## Connecting a Controller and Running Teleop for Unitree Go2
+This guide explains how to control the Unitree Go2 robot using a game controller or keyboard in a ROS2 environment.
+1️⃣Connecting a Controller
+To use a game controller (e.g., Xbox or PlayStation) for teleoperation:
+1. Connect your controller via USB or Bluetooth.
+2. Check if the system detects the controller by running:
+ ```
+    ls /dev/input/
+ ```
+or
+ ```
+    jstest /dev/input/js0
+ ```
+3. If your controller appears in the list, proceed to the next step.
+2️⃣ Running the ROS2 Teleop Node
+Before running the teleoperation commands, launch the Unitree Go2 robot:
+ ```
+   ros2 launch go2_robot_sdk robot.launch.py
+ ```
+🎮 Running Teleop with a Controller
+To control the robot using a joystick:
+1. Start the teleop_twist_joy node:
+ ```
+    ros2 run teleop_twist_joy teleop_node --ros-args --param use_sim_time:=false
+ ```
+2. Use the joystick to move the robot based on the configured button mappings.
+
+⌨️ Running Teleop with a Keyboard
+If you don't have a game controller, you can use your keyboard for control:
+1. Open a terminal and source the workspace:
+    ```
+    source install/setup.bash
+    ```
+2. Run the teleop_twist_keyboard node:
+    ```
+    ros2 run teleop_twist_keyboard teleop_twist_keyboard
+    ```
+3. Use the following keys to move the robot:
+    W - Forward  
+    S - Backward  
+    A - Left  
+    D - Right  
+    Q / E - Rotate Left/Right  
+    Shift - Increase Speed  
+    Ctrl - Decrease Speed
+
+✅ Prerequisites
+
+Ensure that the ROS2 joystick and keyboard teleop nodes are installed before running these commands.
+
+By following these steps, you can efficiently control your Unitree Go2 using either a game controller or a keyboard, enabling seamless navigation and teleoperation.
 
 ## Thanks
 
